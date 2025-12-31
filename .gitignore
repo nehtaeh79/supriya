@@ -47,3 +47,8 @@ mypycov/
 # Misc.
 .DS_Store
 .ipynb_checkpoints/
+
+scripts/output/
+scripts/samples/
+.venv/
+.venv-piano/
