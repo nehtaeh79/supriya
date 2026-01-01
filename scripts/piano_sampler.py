@@ -943,11 +943,104 @@ AMBIENT_01_CHORDS: list[list[int]] = [
     [41, 48, 57, 64, 67],  # Fmaj9
     [43, 50, 59, 62, 69],  # G6/9
 ]
+BACKGROUND_01_SCALE_OFFSETS = [0, 2, 3, 5, 7, 9, 10]  # D Dorian
+BACKGROUND_01_ROOT = 62
 
 
 def _note_to_pan(note: int, *, pan_range: tuple[float, float] = (-0.75, 0.75)) -> float:
     position = (note - NOTE_RANGE.start) / (NOTE_RANGE.stop - NOTE_RANGE.start - 1)
     return pan_range[0] + position * (pan_range[1] - pan_range[0])
+
+
+def _build_scale_notes(
+    root: int,
+    scale_offsets: list[int],
+    *,
+    low: int,
+    high: int,
+) -> list[int]:
+    if low > high:
+        raise ValueError("low must be <= high")
+    root_pc = root % 12
+    pitch_classes = {(root_pc + offset) % 12 for offset in scale_offsets}
+    return [note for note in range(low, high + 1) if note % 12 in pitch_classes]
+
+
+def _euclidean_pattern(pulses: int, steps: int) -> list[int]:
+    if steps <= 0:
+        return []
+    pulses = max(0, min(pulses, steps))
+    if pulses == 0:
+        return [0] * steps
+    if pulses == steps:
+        return [1] * steps
+    return [1 if (i * pulses) % steps < pulses else 0 for i in range(steps)]
+
+
+def _build_scale_chord(scale_notes: list[int], root_index: int) -> list[int]:
+    chord_intervals = (0, 2, 4, 6)
+    max_root = max(0, len(scale_notes) - chord_intervals[-1] - 1)
+    safe_root = max(0, min(root_index, max_root))
+    return [scale_notes[safe_root + interval] for interval in chord_intervals]
+
+
+def _schedule_background_note(
+    server: supriya.Server,
+    *,
+    buffers: list[supriya.Buffer],
+    indices: list[int],
+    pitches: list[int],
+    max_dynamic: int,
+    note: int,
+    velocity: int,
+    start_time: float,
+    duration: float,
+    performance: PerformanceStyle,
+    out_bus: supriya.BusGroup,
+    rng: random.Random,
+) -> None:
+    dynamic = velocity_to_dynamic(
+        velocity,
+        max_dynamic,
+        curve=performance.dynamic_curve,
+        bias=performance.dynamic_bias,
+    )
+    sample_index, rate = select_sample(
+        float(note), float(dynamic), indices, pitches, max_dynamic
+    )
+    buffer = buffers[sample_index]
+    pan = _note_to_pan(note)
+    if performance.pan_jitter:
+        pan += rng.uniform(-performance.pan_jitter, performance.pan_jitter)
+    pan = max(-0.95, min(0.95, pan))
+    amplitude = supriya.conversions.midi_velocity_to_amplitude(velocity)
+    amplitude = (amplitude**performance.amp_exponent) * performance.amp_scale
+    sustain = max(0.0, duration * performance.legato)
+    release = max(
+        float(performance.release_min),
+        min(float(performance.release_max), duration * performance.release_scale),
+    )
+    atk = float(performance.attack)
+    note_time = max(start_time, time.time())
+    reverb_mix = float(performance.fx_wet) * float(performance.fx_reverb_mix)
+    reverb_mix = max(0.0, min(1.0, reverb_mix))
+    with server.at(note_time):
+        server.add_synth(
+            piano_synth_room,
+            buf=buffer,
+            rate=rate,
+            pan=pan,
+            amp=amplitude,
+            atk=atk,
+            sus=sustain,
+            rel=release,
+            out=out_bus,
+            hp=float(performance.fx_hp),
+            lp=float(performance.fx_lp_max),
+            reverb_mix=reverb_mix,
+            room_size=float(performance.fx_room_size),
+            damping=float(performance.fx_damping),
+        )
 
 
 def _spawn_ambient_clouds(
@@ -1087,7 +1180,267 @@ def _trigger_ambient_gesture(
                 hp=hp,
                 lp=lp,
                 out=out_bus,
-            )
+            ) 
+
+
+def run_background_01(args: argparse.Namespace) -> None:
+    intensity = float(args.program_intensity)
+    if not (0.0 <= intensity <= 1.0):
+        raise ValueError("--intensity must be between 0 and 1")
+    rng = random.Random(
+        None if args.program_seed is None else int(args.program_seed)
+    )
+    sample_rate = int(args.program_sample_rate)
+    quiet = (
+        bool(args.program_quiet)
+        if args.program_quiet is not None
+        else bool(getattr(args, "quiet", False))
+    )
+
+    performance = PERFORMANCE_STYLES["debussy"]
+    server = supriya.Server(options=realtime_options(4096, sample_rate=sample_rate)).boot()
+    mix_bus = server.add_bus_group(calculation_rate="audio", count=2)
+    voice_group = server.add_group(
+        add_action="ADD_TO_HEAD", target_node=server.default_group
+    )
+    fx_group = server.add_group(add_action="ADD_AFTER", target_node=voice_group)
+    buffers = load_sample_buffers(server, SAMPLE_PACK)
+    indices, pitches, max_dynamic = build_lookup(quiet=quiet)
+    server.add_synthdefs(
+        piano_synth_room,
+        ambient_piano_gesture,
+        ambient_piano_grain_cloud,
+        ambient_piano_master_fx,
+    )
+    server.sync()
+
+    server.add_synth(
+        ambient_piano_master_fx,
+        target_node=fx_group,
+        add_action="ADD_TO_HEAD",
+        in_bus=mix_bus,
+        out=0,
+        wet=0.9,
+        hp=24.0,
+        lp_min=550.0,
+        lp_max=14000.0,
+        lp_lfo_rate=0.008,
+        delay_time=0.48,
+        delay_decay=7.0,
+        delay_mix=0.18,
+        reverb_mix=0.42,
+        room_size=0.93,
+        damping=0.48,
+        shimmer_mix=0.05,
+        shimmer_ratio=1.5,
+    )
+
+    scale_notes = _build_scale_notes(
+        BACKGROUND_01_ROOT,
+        BACKGROUND_01_SCALE_OFFSETS,
+        low=40,
+        high=92,
+    )
+    if len(scale_notes) < 8:
+        raise RuntimeError("Scale configuration produced too few notes.")
+
+    chord_root_index = rng.randint(0, len(scale_notes) - 7)
+    chord_notes = _build_scale_chord(scale_notes, chord_root_index)
+    fade_time = 8.0
+    active_clouds = _spawn_ambient_clouds(
+        server,
+        buffers=buffers,
+        indices=indices,
+        pitches=pitches,
+        max_dynamic=max_dynamic,
+        chord_notes=chord_notes,
+        target_node=voice_group,
+        out_bus=mix_bus,
+        intensity=intensity,
+        rng=rng,
+        fade_time=fade_time,
+    )
+    _trigger_ambient_gesture(
+        server,
+        buffers=buffers,
+        indices=indices,
+        pitches=pitches,
+        max_dynamic=max_dynamic,
+        chord_notes=chord_notes,
+        out_bus=mix_bus,
+        intensity=intensity,
+        rng=rng,
+        accent=True,
+    )
+
+    print("background_01 running. Press Ctrl-C to stop.")
+    start = time.monotonic()
+    start_wall = time.time()
+    last_note = rng.choice(chord_notes)
+    energy = intensity
+    tempo = 44.0 + (intensity * 18.0) + rng.uniform(-3.0, 3.0)
+    tempo_target = tempo
+
+    def to_wall(event_time: float) -> float:
+        return start_wall + (event_time - start)
+
+    pattern_steps = rng.choice([8, 12, 16])
+    pattern_pulses = max(2, int(pattern_steps * (0.25 + intensity * 0.35)))
+    pattern = _euclidean_pattern(pattern_pulses, pattern_steps)
+    if pattern:
+        shift = rng.randrange(len(pattern))
+        pattern = pattern[shift:] + pattern[:shift]
+    step_index = 0
+    next_step = start + rng.uniform(0.2, 0.6)
+    next_phrase = start + rng.uniform(14.0, 22.0)
+    next_chord_change = start + rng.uniform(32.0, 55.0)
+    next_gesture = start + rng.uniform(10.0, 18.0)
+    next_tempo_shift = start + rng.uniform(18.0, 34.0)
+    pending_free: list[tuple[float, list[supriya.Synth]]] = []
+
+    try:
+        while True:
+            now = time.monotonic()
+            if args.program_duration is not None and (now - start) >= float(
+                args.program_duration
+            ):
+                break
+            if pending_free:
+                still_pending: list[tuple[float, list[supriya.Synth]]] = []
+                for free_at, synths in pending_free:
+                    if now < free_at:
+                        still_pending.append((free_at, synths))
+                        continue
+                    for synth in synths:
+                        synth.free()
+                pending_free = still_pending
+            if now >= next_tempo_shift:
+                tempo_target = max(36.0, min(72.0, tempo + rng.uniform(-6.0, 6.0)))
+                next_tempo_shift = now + rng.uniform(18.0, 34.0)
+            tempo += (tempo_target - tempo) * 0.02
+            beat_duration = 60.0 / max(20.0, tempo)
+            if now >= next_phrase:
+                energy = max(0.0, min(1.0, energy + rng.uniform(-0.18, 0.18)))
+                pattern_steps = rng.choice([8, 12, 16])
+                pattern_pulses = max(2, int(pattern_steps * (0.25 + energy * 0.4)))
+                pattern = _euclidean_pattern(pattern_pulses, pattern_steps)
+                if pattern:
+                    shift = rng.randrange(len(pattern))
+                    pattern = pattern[shift:] + pattern[:shift]
+                step_index = 0
+                next_phrase = now + rng.uniform(14.0, 24.0)
+            if now >= next_chord_change:
+                chord_root_index += rng.choice([-2, -1, 0, 1, 2])
+                chord_root_index = max(0, min(chord_root_index, len(scale_notes) - 7))
+                chord_notes = _build_scale_chord(scale_notes, chord_root_index)
+                for synth in active_clouds:
+                    synth.set(amp=0.0)
+                pending_free.append((now + fade_time + 1.0, active_clouds))
+                active_clouds = _spawn_ambient_clouds(
+                    server,
+                    buffers=buffers,
+                    indices=indices,
+                    pitches=pitches,
+                    max_dynamic=max_dynamic,
+                    chord_notes=chord_notes,
+                    target_node=voice_group,
+                    out_bus=mix_bus,
+                    intensity=intensity,
+                    rng=rng,
+                    fade_time=fade_time,
+                )
+                _trigger_ambient_gesture(
+                    server,
+                    buffers=buffers,
+                    indices=indices,
+                    pitches=pitches,
+                    max_dynamic=max_dynamic,
+                    chord_notes=chord_notes,
+                    out_bus=mix_bus,
+                    intensity=intensity,
+                    rng=rng,
+                    accent=True,
+                )
+                next_chord_change = now + rng.uniform(30.0, 55.0)
+            if now >= next_gesture:
+                _trigger_ambient_gesture(
+                    server,
+                    buffers=buffers,
+                    indices=indices,
+                    pitches=pitches,
+                    max_dynamic=max_dynamic,
+                    chord_notes=chord_notes,
+                    out_bus=mix_bus,
+                    intensity=intensity,
+                    rng=rng,
+                    accent=False,
+                )
+                next_gesture = now + rng.uniform(12.0, 22.0)
+            if now >= next_step:
+                play_step = bool(pattern and pattern[step_index])
+                step_index = (step_index + 1) % max(1, len(pattern))
+                if play_step and rng.random() < (0.6 + intensity * 0.3):
+                    use_chord = rng.random() < (0.65 + energy * 0.2)
+                    if use_chord:
+                        note = rng.choice(chord_notes)
+                    else:
+                        scale_index = scale_notes.index(last_note)
+                        window = scale_notes[
+                            max(0, scale_index - 4) : min(len(scale_notes), scale_index + 5)
+                        ]
+                        note = rng.choice(window or scale_notes)
+                    last_note = note
+                    velocity_center = 30 + (energy * 28)
+                    velocity_spread = 12 + (energy * 10)
+                    velocity = int(
+                        max(
+                            16,
+                            min(
+                                84,
+                                rng.gauss(velocity_center, velocity_spread),
+                            ),
+                        )
+                    )
+                    duration = beat_duration * rng.choice([0.75, 1.0, 1.5, 2.25])
+                    _schedule_background_note(
+                        server,
+                        buffers=buffers,
+                        indices=indices,
+                        pitches=pitches,
+                        max_dynamic=max_dynamic,
+                        note=note,
+                        velocity=velocity,
+                        start_time=to_wall(now + rng.uniform(0.0, 0.12)),
+                        duration=duration,
+                        performance=performance,
+                        out_bus=mix_bus,
+                        rng=rng,
+                    )
+                    if rng.random() < (0.12 + (1.0 - intensity) * 0.18):
+                        bass_note = max(32, chord_notes[0] - 12)
+                        _schedule_background_note(
+                            server,
+                            buffers=buffers,
+                            indices=indices,
+                            pitches=pitches,
+                            max_dynamic=max_dynamic,
+                            note=bass_note,
+                            velocity=max(18, velocity - 8),
+                            start_time=to_wall(now + rng.uniform(0.0, 0.2)),
+                            duration=beat_duration * rng.uniform(2.0, 3.5),
+                            performance=performance,
+                            out_bus=mix_bus,
+                            rng=rng,
+                        )
+                step_jitter = rng.uniform(-0.08, 0.1)
+                step_multiplier = rng.choice([0.75, 1.0, 1.25])
+                step_duration = max(0.12, beat_duration * step_multiplier + step_jitter)
+                next_step = now + step_duration
+            time.sleep(0.05)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.quit()
 
 
 def run_ambient_01(args: argparse.Namespace) -> None:
@@ -1246,6 +1599,11 @@ def run_ambient_01(args: argparse.Namespace) -> None:
 
 
 PROGRAMS: dict[str, Program] = {
+    "background_01": Program(
+        name="background_01",
+        description="Procedural background piano with evolving harmony and timing",
+        runner=run_background_01,
+    ),
     "ambient_01": Program(
         name="ambient_01",
         description="Evolving piano ambience with grain clouds and long gestures",
