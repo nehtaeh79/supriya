@@ -1152,7 +1152,7 @@ def _trigger_ambient_phrase(
         return
     phrase_length = rng.randint(5, 9)
     base_delay = rng.uniform(0.0, 0.4)
-    spacing = rng.uniform(0.12, 0.35) * (1.15 - (intensity * 0.4))
+    base_spacing = rng.uniform(0.12, 0.35) * (1.15 - (intensity * 0.4))
     chord_tones = [note for note in chord_notes if 48 <= note <= 84]
     scale_window = [note for note in scale if 48 <= note <= 84]
     chord_tones = sorted({_snap_to_scale(note, scale) for note in chord_tones}) or []
@@ -1164,6 +1164,24 @@ def _trigger_ambient_phrase(
     base_release = rng.uniform(6.0, 12.0)
     phrase_peak = rng.uniform(0.55, 0.9)
     phrase_curve = rng.uniform(0.9, 1.4)
+    interval_count = max(0, phrase_length - 1)
+    if interval_count:
+        timing_multipliers: list[float] = []
+        for interval in range(interval_count):
+            progress = interval / max(1, interval_count - 1)
+            ease = 0.5 - 0.5 * math.cos(math.pi * progress)
+            timing_multipliers.append(0.85 + (ease * 0.3))
+        total = sum(timing_multipliers)
+        timing_multipliers = [
+            multiplier * interval_count / total for multiplier in timing_multipliers
+        ]
+        offsets = [base_delay]
+        current_offset = base_delay
+        for multiplier in timing_multipliers:
+            current_offset += base_spacing * multiplier
+            offsets.append(current_offset)
+    else:
+        offsets = [base_delay]
     phrase_tension = max(0.0, min(1.0, rng.uniform(0.35, 0.95) * (0.6 + intensity * 0.4)))
     base_time = time.time()
     for step in range(phrase_length):
@@ -1222,7 +1240,7 @@ def _trigger_ambient_phrase(
         rel = base_release + rng.uniform(-2.0, 4.0)
         hp = rng.uniform(30.0, 80.0)
         lp = rng.uniform(4500.0, 16000.0)
-        offset = base_delay + (step * spacing) + rng.uniform(0.0, 0.06)
+        offset = offsets[step] + rng.uniform(-0.03, 0.03)
         with server.at(base_time + offset):
             server.add_synth(
                 ambient_piano_gesture,
