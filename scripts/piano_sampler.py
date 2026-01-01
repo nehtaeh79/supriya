@@ -14,6 +14,7 @@ import math
 import random
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -1510,6 +1511,9 @@ def run_ambient_02(args: argparse.Namespace) -> None:
     next_chord_change = start + rng.uniform(28.0, 52.0)
     next_scale_shift = start + rng.uniform(180.0, 360.0)
     next_fx_update = start + rng.uniform(60.0, 120.0)
+    recent_events: deque[float] = deque()
+    recent_window = 30.0
+    event_threshold = max(1, int(round(2 + (intensity * 6))))
     pending_free: list[tuple[float, list[supriya.Synth]]] = []
     try:
         while True:
@@ -1518,6 +1522,8 @@ def run_ambient_02(args: argparse.Namespace) -> None:
                 args.program_duration
             ):
                 break
+            while recent_events and (now - recent_events[0]) > recent_window:
+                recent_events.popleft()
             if pending_free:
                 still_pending: list[tuple[float, list[supriya.Synth]]] = []
                 for free_at, synths in pending_free:
@@ -1600,41 +1606,50 @@ def run_ambient_02(args: argparse.Namespace) -> None:
                     rng=rng,
                     accent=True,
                 )
+                recent_events.append(now)
                 next_chord_change = now + rng.uniform(24.0, 58.0)
 
             if now >= next_gesture and rng.random() < 0.9:
-                _trigger_ambient_gesture(
-                    server,
-                    buffers=buffers,
-                    indices=indices,
-                    pitches=pitches,
-                    max_dynamic=max_dynamic,
-                    chord_notes=chord_notes,
-                    out_bus=mix_bus,
-                    intensity=activity,
-                    rng=rng,
-                    accent=False,
-                )
-                next_gesture = now + rng.uniform(8.0, 20.0) * (
-                    1.2 - (activity * 0.4)
-                )
+                if len(recent_events) >= event_threshold:
+                    next_gesture = now + rng.uniform(3.0, 8.0)
+                else:
+                    _trigger_ambient_gesture(
+                        server,
+                        buffers=buffers,
+                        indices=indices,
+                        pitches=pitches,
+                        max_dynamic=max_dynamic,
+                        chord_notes=chord_notes,
+                        out_bus=mix_bus,
+                        intensity=activity,
+                        rng=rng,
+                        accent=False,
+                    )
+                    recent_events.append(now)
+                    next_gesture = now + rng.uniform(8.0, 20.0) * (
+                        1.2 - (activity * 0.4)
+                    )
 
             if now >= next_phrase and rng.random() < 0.75:
-                _trigger_ambient_phrase(
-                    server,
-                    buffers=buffers,
-                    indices=indices,
-                    pitches=pitches,
-                    max_dynamic=max_dynamic,
-                    scale=scale,
-                    chord_notes=chord_notes,
-                    out_bus=mix_bus,
-                    intensity=activity,
-                    rng=rng,
-                )
-                next_phrase = now + rng.uniform(14.0, 36.0) * (
-                    1.3 - (activity * 0.5)
-                )
+                if len(recent_events) >= event_threshold:
+                    next_phrase = now + rng.uniform(6.0, 14.0)
+                else:
+                    _trigger_ambient_phrase(
+                        server,
+                        buffers=buffers,
+                        indices=indices,
+                        pitches=pitches,
+                        max_dynamic=max_dynamic,
+                        scale=scale,
+                        chord_notes=chord_notes,
+                        out_bus=mix_bus,
+                        intensity=activity,
+                        rng=rng,
+                    )
+                    recent_events.append(now)
+                    next_phrase = now + rng.uniform(14.0, 36.0) * (
+                        1.3 - (activity * 0.5)
+                    )
 
             time.sleep(0.1)
     except KeyboardInterrupt:
