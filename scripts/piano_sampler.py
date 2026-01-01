@@ -1289,7 +1289,7 @@ def run_ambient_01(args: argparse.Namespace) -> None:
     )
     server.sync()
 
-    server.add_synth(
+    fx_synth = server.add_synth(
         ambient_piano_master_fx,
         target_node=fx_group,
         add_action="ADD_TO_HEAD",
@@ -1501,10 +1501,15 @@ def run_ambient_02(args: argparse.Namespace) -> None:
     start = time.monotonic()
     activity = intensity
     density_mod = 1.0
+    lp_min = 620.0
+    lp_max = 15000.0
+    reverb_mix = 0.42
+    delay_mix = 0.22
     next_phrase = start + rng.uniform(6.0, 12.0)
     next_gesture = start + rng.uniform(4.0, 9.0)
     next_chord_change = start + rng.uniform(28.0, 52.0)
     next_scale_shift = start + rng.uniform(180.0, 360.0)
+    next_fx_update = start + rng.uniform(60.0, 120.0)
     pending_free: list[tuple[float, list[supriya.Synth]]] = []
     try:
         while True:
@@ -1533,6 +1538,31 @@ def run_ambient_02(args: argparse.Namespace) -> None:
             density_mod = _bounded_random_walk(
                 density_mod, step=0.08, min_value=0.7, max_value=1.35, rng=rng
             )
+
+            if now >= next_fx_update:
+                lp_min = _bounded_random_walk(
+                    lp_min, step=60.0, min_value=420.0, max_value=900.0, rng=rng
+                )
+                lp_max = _bounded_random_walk(
+                    lp_max, step=400.0, min_value=12000.0, max_value=17000.0, rng=rng
+                )
+                reverb_mix = _bounded_random_walk(
+                    reverb_mix, step=0.02, min_value=0.3, max_value=0.55, rng=rng
+                )
+                delay_mix = _bounded_random_walk(
+                    delay_mix, step=0.02, min_value=0.15, max_value=0.35, rng=rng
+                )
+                min_gap = 2000.0
+                if lp_max < lp_min + min_gap:
+                    lp_max = min(17000.0, lp_min + min_gap)
+                    lp_min = max(420.0, lp_max - min_gap)
+                fx_synth.set(
+                    lp_min=lp_min,
+                    lp_max=lp_max,
+                    reverb_mix=reverb_mix,
+                    delay_mix=delay_mix,
+                )
+                next_fx_update = now + rng.uniform(60.0, 120.0)
 
             if now >= next_scale_shift:
                 scale_name, root, intervals = rng.choice(AMBIENT_02_SCALES)
