@@ -999,7 +999,6 @@ def _build_scale_chord(scale_notes: list[int], root_index: int) -> list[int]:
     return [scale_notes[safe_root + interval] for interval in chord_intervals]
 
 
-def (
 def _bounded_random_walk(
     value: float,
     *,
@@ -1155,12 +1154,17 @@ def _trigger_ambient_phrase(
     base_delay = rng.uniform(0.0, 0.4)
     spacing = rng.uniform(0.12, 0.35) * (1.15 - (intensity * 0.4))
     chord_tones = [note for note in chord_notes if 48 <= note <= 84]
-    anchor = rng.choice(chord_tones or scale)
+    scale_window = [note for note in scale if 48 <= note <= 84]
+    chord_tones = sorted({_snap_to_scale(note, scale) for note in chord_tones}) or []
+    chord_tones = [note for note in chord_tones if 48 <= note <= 84]
+    non_chord_tones = [note for note in scale_window if note not in chord_tones]
+    anchor = rng.choice(chord_tones or scale_window or scale)
     direction = rng.choice([-1, 1])
     intervals = [0, 2, 3, 5, 7]
     base_release = rng.uniform(6.0, 12.0)
     phrase_peak = rng.uniform(0.55, 0.9)
     phrase_curve = rng.uniform(0.9, 1.4)
+    phrase_tension = max(0.0, min(1.0, rng.uniform(0.35, 0.95) * (0.6 + intensity * 0.4)))
     base_time = time.time()
     for step in range(phrase_length):
         phase = step / max(1, phrase_length - 1)
@@ -1171,10 +1175,30 @@ def _trigger_ambient_phrase(
             fall = (phase - phrase_peak) / max(0.001, 1.0 - phrase_peak)
             phrase_env = (1.0 - fall) ** phrase_curve
         phrase_env = max(0.4, min(1.0, phrase_env))
+        peak_proximity = 1.0 - min(
+            1.0,
+            abs(phase - phrase_peak) / max(phrase_peak, 1.0 - phrase_peak),
+        )
+        post_peak = max(0.0, (phase - phrase_peak) / max(0.001, 1.0 - phrase_peak))
         leap = direction * rng.choice(intervals)
         target = _snap_to_scale(anchor + leap, scale)
+        non_chord_probability = (0.08 + (0.45 * phrase_tension)) * peak_proximity
+        non_chord_probability *= 1.0 - (0.8 * post_peak)
+        if non_chord_tones and rng.random() < non_chord_probability:
+            target = min(non_chord_tones, key=lambda candidate: abs(candidate - target))
+        else:
+            chord_bias = 0.3 + (0.6 * post_peak)
+            if chord_tones and rng.random() < chord_bias:
+                target = min(chord_tones, key=lambda candidate: abs(candidate - target))
         if rng.random() < 0.35:
-            anchor = _snap_to_scale(anchor + rng.choice([-2, 2, 4]), scale)
+            anchor_target = _snap_to_scale(anchor + rng.choice([-2, 2, 4]), scale)
+            anchor_bias = 0.35 + (0.5 * post_peak)
+            if chord_tones and rng.random() < anchor_bias:
+                anchor = min(
+                    chord_tones, key=lambda candidate: abs(candidate - anchor_target)
+                )
+            else:
+                anchor = anchor_target
         velocity = int(
             22
             + (intensity * 50)
