@@ -14,6 +14,7 @@ import math
 import random
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -943,11 +944,181 @@ AMBIENT_01_CHORDS: list[list[int]] = [
     [41, 48, 57, 64, 67],  # Fmaj9
     [43, 50, 59, 62, 69],  # G6/9
 ]
+AMBIENT_02_SCALES: list[tuple[str, int, list[int]]] = [
+    ("dorian", 50, [0, 2, 3, 5, 7, 9, 10]),  # D dorian
+    ("aeolian", 45, [0, 2, 3, 5, 7, 8, 10]),  # A minor
+    ("mixolydian", 48, [0, 2, 4, 5, 7, 9, 10]),  # C mixolydian
+]
+AMBIENT_02_DEGREE_TRANSITIONS: dict[int, list[tuple[int, float]]] = {
+    0: [(0, 0.25), (3, 0.2), (4, 0.2), (5, 0.15), (2, 0.2)],
+    1: [(4, 0.25), (6, 0.2), (0, 0.3), (3, 0.25)],
+    2: [(5, 0.3), (0, 0.3), (4, 0.2), (6, 0.2)],
+    3: [(0, 0.35), (5, 0.25), (1, 0.2), (4, 0.2)],
+    4: [(0, 0.4), (3, 0.25), (5, 0.2), (1, 0.15)],
+    5: [(0, 0.35), (3, 0.3), (4, 0.2), (1, 0.15)],
+    6: [(0, 0.4), (2, 0.25), (4, 0.2), (1, 0.15)],
+}
 
 
 def _note_to_pan(note: int, *, pan_range: tuple[float, float] = (-0.75, 0.75)) -> float:
     position = (note - NOTE_RANGE.start) / (NOTE_RANGE.stop - NOTE_RANGE.start - 1)
     return pan_range[0] + position * (pan_range[1] - pan_range[0])
+
+
+def _bounded_random_walk(
+    value: float,
+    *,
+    step: float,
+    min_value: float,
+    max_value: float,
+    rng: random.Random,
+) -> float:
+    value += rng.uniform(-step, step)
+    return max(min_value, min(max_value, value))
+
+
+def _build_scale(
+    root: int,
+    intervals: list[int],
+    *,
+    low: int = 36,
+    high: int = 96,
+) -> list[int]:
+    scale: list[int] = []
+    for octave in range(-2, 5):
+        base = root + (octave * 12)
+        for interval in intervals:
+            note = base + interval
+            if low <= note <= high:
+                scale.append(note)
+    return sorted(set(scale))
+
+
+def _snap_to_scale(note: int, scale: list[int]) -> int:
+    if not scale:
+        return note
+    return min(scale, key=lambda candidate: abs(candidate - note))
+
+
+def _choose_degree(current: int, rng: random.Random) -> int:
+    options = AMBIENT_02_DEGREE_TRANSITIONS.get(current)
+    if not options:
+        return rng.randrange(7)
+    roll = rng.random()
+    cumulative = 0.0
+    for degree, weight in options:
+        cumulative += weight
+        if roll <= cumulative:
+            return degree
+    return options[-1][0]
+
+
+def _build_chord_from_degree(scale: list[int], degree: int) -> list[int]:
+    if not scale:
+        return []
+    scale_degrees = sorted(scale)
+    pitch_classes: list[int] = []
+    for note in scale_degrees:
+        pitch_class = note % 12
+        if pitch_class not in pitch_classes:
+            pitch_classes.append(pitch_class)
+    if not pitch_classes:
+        return []
+    target_pc = pitch_classes[degree % len(pitch_classes)]
+    base_candidates = [note for note in scale_degrees if note % 12 == target_pc]
+    if not base_candidates:
+        base_candidates = scale_degrees
+    root = min(base_candidates, key=lambda note: abs(note - 52))
+    chord = [
+        root,
+        _snap_to_scale(root + 3, scale_degrees),
+        _snap_to_scale(root + 7, scale_degrees),
+        _snap_to_scale(root + 10, scale_degrees),
+    ]
+    chord.extend(
+        _snap_to_scale(note + 12, scale_degrees)
+        for note in chord
+        if note + 12 <= 88
+    )
+    return sorted(set(chord))
+
+
+def _trigger_ambient_phrase(
+    server: supriya.Server,
+    *,
+    buffers: list[supriya.Buffer],
+    indices: list[int],
+    pitches: list[int],
+    max_dynamic: int,
+    scale: list[int],
+    chord_notes: list[int],
+    out_bus: supriya.BusGroup,
+    intensity: float,
+    rng: random.Random,
+) -> None:
+    if not scale:
+        return
+    phrase_length = rng.randint(5, 9)
+    base_delay = rng.uniform(0.0, 0.4)
+    spacing = rng.uniform(0.12, 0.35) * (1.15 - (intensity * 0.4))
+    chord_tones = [note for note in chord_notes if 48 <= note <= 84]
+    anchor = rng.choice(chord_tones or scale)
+    direction = rng.choice([-1, 1])
+    intervals = [0, 2, 3, 5, 7]
+    base_release = rng.uniform(6.0, 12.0)
+    phrase_peak = rng.uniform(0.55, 0.9)
+    phrase_curve = rng.uniform(0.9, 1.4)
+    base_time = time.time()
+    for step in range(phrase_length):
+        phase = step / max(1, phrase_length - 1)
+        if phase <= phrase_peak:
+            rise = phase / max(0.001, phrase_peak)
+            phrase_env = rise**phrase_curve
+        else:
+            fall = (phase - phrase_peak) / max(0.001, 1.0 - phrase_peak)
+            phrase_env = (1.0 - fall) ** phrase_curve
+        phrase_env = max(0.4, min(1.0, phrase_env))
+        leap = direction * rng.choice(intervals)
+        target = _snap_to_scale(anchor + leap, scale)
+        if rng.random() < 0.35:
+            anchor = _snap_to_scale(anchor + rng.choice([-2, 2, 4]), scale)
+        velocity = int(
+            22
+            + (intensity * 50)
+            + (phrase_env * 18)
+            + rng.uniform(-6, 8)
+        )
+        velocity = max(16, min(92, velocity))
+        dynamic = velocity_to_dynamic(velocity, max_dynamic)
+        sample_index, rate = select_sample(
+            float(target), float(dynamic), indices, pitches, max_dynamic
+        )
+        buffer = buffers[sample_index]
+        detune = rng.uniform(0.998, 1.002)
+        pan = _note_to_pan(target) + rng.uniform(-0.1, 0.1)
+        amplitude = (
+            supriya.conversions.midi_velocity_to_amplitude(velocity)
+            * (0.035 + (intensity * 0.045))
+            * (0.75 + (phrase_env * 0.35))
+        )
+        atk = rng.uniform(0.02, 0.12)
+        rel = base_release + rng.uniform(-2.0, 4.0)
+        hp = rng.uniform(30.0, 80.0)
+        lp = rng.uniform(4500.0, 16000.0)
+        offset = base_delay + (step * spacing) + rng.uniform(0.0, 0.06)
+        with server.at(base_time + offset):
+            server.add_synth(
+                ambient_piano_gesture,
+                buf=buffer,
+                rate=rate * detune,
+                pan=pan,
+                amp=amplitude,
+                atk=atk,
+                rel=rel,
+                hp=hp,
+                lp=lp,
+                out=out_bus,
+            )
 
 
 def _spawn_ambient_clouds(
@@ -1119,7 +1290,7 @@ def run_ambient_01(args: argparse.Namespace) -> None:
     )
     server.sync()
 
-    server.add_synth(
+    fx_synth = server.add_synth(
         ambient_piano_master_fx,
         target_node=fx_group,
         add_action="ADD_TO_HEAD",
@@ -1245,6 +1416,248 @@ def run_ambient_01(args: argparse.Namespace) -> None:
         server.quit()
 
 
+def run_ambient_02(args: argparse.Namespace) -> None:
+    intensity = float(args.program_intensity)
+    if not (0.0 <= intensity <= 1.0):
+        raise ValueError("--intensity must be between 0 and 1")
+    rng = random.Random(
+        None if args.program_seed is None else int(args.program_seed)
+    )
+    sample_rate = int(args.program_sample_rate)
+    quiet = (
+        bool(args.program_quiet)
+        if args.program_quiet is not None
+        else bool(getattr(args, "quiet", False))
+    )
+
+    scale_name, root, intervals = rng.choice(AMBIENT_02_SCALES)
+    scale = _build_scale(root, intervals)
+    degree = rng.randrange(7)
+
+    server = supriya.Server(options=realtime_options(3072, sample_rate=sample_rate)).boot()
+    mix_bus = server.add_bus_group(calculation_rate="audio", count=2)
+    voice_group = server.add_group(
+        add_action="ADD_TO_HEAD", target_node=server.default_group
+    )
+    fx_group = server.add_group(add_action="ADD_AFTER", target_node=voice_group)
+    buffers = load_sample_buffers(server, SAMPLE_PACK)
+    indices, pitches, max_dynamic = build_lookup(quiet=quiet)
+    server.add_synthdefs(
+        ambient_piano_gesture,
+        ambient_piano_grain_cloud,
+        ambient_piano_master_fx,
+    )
+    server.sync()
+
+    server.add_synth(
+        ambient_piano_master_fx,
+        target_node=fx_group,
+        add_action="ADD_TO_HEAD",
+        in_bus=mix_bus,
+        out=0,
+        wet=0.94,
+        hp=26.0,
+        lp_min=620.0,
+        lp_max=15000.0,
+        lp_lfo_rate=0.008,
+        delay_time=0.52,
+        delay_decay=7.0,
+        delay_mix=0.22,
+        reverb_mix=0.42,
+        room_size=0.95,
+        damping=0.42,
+        shimmer_mix=0.09,
+        shimmer_ratio=1.5,
+    )
+
+    chord_notes = _build_chord_from_degree(scale, degree)
+    fade_time = 10.0
+    active_clouds = _spawn_ambient_clouds(
+        server,
+        buffers=buffers,
+        indices=indices,
+        pitches=pitches,
+        max_dynamic=max_dynamic,
+        chord_notes=chord_notes,
+        target_node=voice_group,
+        out_bus=mix_bus,
+        intensity=intensity,
+        rng=rng,
+        fade_time=fade_time,
+    )
+    _trigger_ambient_gesture(
+        server,
+        buffers=buffers,
+        indices=indices,
+        pitches=pitches,
+        max_dynamic=max_dynamic,
+        chord_notes=chord_notes,
+        out_bus=mix_bus,
+        intensity=intensity,
+        rng=rng,
+        accent=True,
+    )
+
+    print(f"ambient_02 running ({scale_name}). Press Ctrl-C to stop.")
+    start = time.monotonic()
+    activity = intensity
+    density_mod = 1.0
+    lp_min = 620.0
+    lp_max = 15000.0
+    reverb_mix = 0.42
+    delay_mix = 0.22
+    next_phrase = start + rng.uniform(6.0, 12.0)
+    next_gesture = start + rng.uniform(4.0, 9.0)
+    next_chord_change = start + rng.uniform(28.0, 52.0)
+    next_scale_shift = start + rng.uniform(180.0, 360.0)
+    next_fx_update = start + rng.uniform(60.0, 120.0)
+    recent_events: deque[float] = deque()
+    recent_window = 30.0
+    event_threshold = max(1, int(round(2 + (intensity * 6))))
+    pending_free: list[tuple[float, list[supriya.Synth]]] = []
+    try:
+        while True:
+            now = time.monotonic()
+            if args.program_duration is not None and (now - start) >= float(
+                args.program_duration
+            ):
+                break
+            while recent_events and (now - recent_events[0]) > recent_window:
+                recent_events.popleft()
+            if pending_free:
+                still_pending: list[tuple[float, list[supriya.Synth]]] = []
+                for free_at, synths in pending_free:
+                    if now < free_at:
+                        still_pending.append((free_at, synths))
+                        continue
+                    for synth in synths:
+                        synth.free()
+                pending_free = still_pending
+
+            activity = _bounded_random_walk(
+                activity,
+                step=0.05,
+                min_value=max(0.2, intensity * 0.6),
+                max_value=min(1.0, intensity * 1.35),
+                rng=rng,
+            )
+            density_mod = _bounded_random_walk(
+                density_mod, step=0.08, min_value=0.7, max_value=1.35, rng=rng
+            )
+
+            if now >= next_fx_update:
+                lp_min = _bounded_random_walk(
+                    lp_min, step=60.0, min_value=420.0, max_value=900.0, rng=rng
+                )
+                lp_max = _bounded_random_walk(
+                    lp_max, step=400.0, min_value=12000.0, max_value=17000.0, rng=rng
+                )
+                reverb_mix = _bounded_random_walk(
+                    reverb_mix, step=0.02, min_value=0.3, max_value=0.55, rng=rng
+                )
+                delay_mix = _bounded_random_walk(
+                    delay_mix, step=0.02, min_value=0.15, max_value=0.35, rng=rng
+                )
+                min_gap = 2000.0
+                if lp_max < lp_min + min_gap:
+                    lp_max = min(17000.0, lp_min + min_gap)
+                    lp_min = max(420.0, lp_max - min_gap)
+                fx_synth.set(
+                    lp_min=lp_min,
+                    lp_max=lp_max,
+                    reverb_mix=reverb_mix,
+                    delay_mix=delay_mix,
+                )
+                next_fx_update = now + rng.uniform(60.0, 120.0)
+
+            if now >= next_scale_shift:
+                scale_name, root, intervals = rng.choice(AMBIENT_02_SCALES)
+                scale = _build_scale(root, intervals)
+                next_scale_shift = now + rng.uniform(180.0, 360.0)
+
+            if now >= next_chord_change:
+                degree = _choose_degree(degree, rng)
+                chord_notes = _build_chord_from_degree(scale, degree)
+                for synth in active_clouds:
+                    synth.set(amp=0.0)
+                pending_free.append((now + fade_time + 1.0, active_clouds))
+                active_clouds = _spawn_ambient_clouds(
+                    server,
+                    buffers=buffers,
+                    indices=indices,
+                    pitches=pitches,
+                    max_dynamic=max_dynamic,
+                    chord_notes=chord_notes,
+                    target_node=voice_group,
+                    out_bus=mix_bus,
+                    intensity=activity * density_mod,
+                    rng=rng,
+                    fade_time=fade_time,
+                )
+                _trigger_ambient_gesture(
+                    server,
+                    buffers=buffers,
+                    indices=indices,
+                    pitches=pitches,
+                    max_dynamic=max_dynamic,
+                    chord_notes=chord_notes,
+                    out_bus=mix_bus,
+                    intensity=activity,
+                    rng=rng,
+                    accent=True,
+                )
+                recent_events.append(now)
+                next_chord_change = now + rng.uniform(24.0, 58.0)
+
+            if now >= next_gesture and rng.random() < 0.9:
+                if len(recent_events) >= event_threshold:
+                    next_gesture = now + rng.uniform(3.0, 8.0)
+                else:
+                    _trigger_ambient_gesture(
+                        server,
+                        buffers=buffers,
+                        indices=indices,
+                        pitches=pitches,
+                        max_dynamic=max_dynamic,
+                        chord_notes=chord_notes,
+                        out_bus=mix_bus,
+                        intensity=activity,
+                        rng=rng,
+                        accent=False,
+                    )
+                    recent_events.append(now)
+                    next_gesture = now + rng.uniform(8.0, 20.0) * (
+                        1.2 - (activity * 0.4)
+                    )
+
+            if now >= next_phrase and rng.random() < 0.75:
+                if len(recent_events) >= event_threshold:
+                    next_phrase = now + rng.uniform(6.0, 14.0)
+                else:
+                    _trigger_ambient_phrase(
+                        server,
+                        buffers=buffers,
+                        indices=indices,
+                        pitches=pitches,
+                        max_dynamic=max_dynamic,
+                        scale=scale,
+                        chord_notes=chord_notes,
+                        out_bus=mix_bus,
+                        intensity=activity,
+                        rng=rng,
+                    )
+                    recent_events.append(now)
+                    next_phrase = now + rng.uniform(14.0, 36.0) * (
+                        1.3 - (activity * 0.5)
+                    )
+
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.quit()
+
+
 PROGRAMS: dict[str, Program] = {
     "ambient_01": Program(
         name="ambient_01",
@@ -1253,7 +1666,8 @@ PROGRAMS: dict[str, Program] = {
     ),
     "ambient_02": Program(
         name="ambient_02",
-        description="Darker drones and sparse phrases (planned)",
+        description="Procedural ambient background with evolving scale and motifs",
+        runner=run_ambient_02,
     ),
     "nocturne_01": Program(
         name="nocturne_01",
